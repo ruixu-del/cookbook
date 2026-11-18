@@ -483,12 +483,25 @@ def _temporary_private_file(payload: str) -> Path:
     return path
 
 
-def _nonroot_agent_user(environment: Any) -> str | None:
-    """Return Harbor's effective task user when it needs an ownership handoff."""
+async def _nonroot_agent_user(environment: Any) -> str | None:
+    """Return the user that actually runs agent commands inside the sandbox.
+
+    Harbor leaves default_user unset when task.toml has no agent user.
+    Docker Compose then runs commands as the image's final USER, which may be
+    nonroot. Probe that effective UID once before choosing the private upload
+    and sidecar directory ownership path.
+    """
 
     user = getattr(environment, "default_user", None)
     if user is None:
-        return None
+        uid = getattr(environment, "_tito_effective_agent_uid", None)
+        if uid is None:
+            result = await environment.exec(command="id -u", cwd="/")
+            if result.return_code != 0 or not str(result.stdout).strip().isdecimal():
+                raise RuntimeError("failed to determine the effective TITO agent user")
+            uid = str(int(str(result.stdout).strip()))
+            environment._tito_effective_agent_uid = uid
+        user = uid
     value = str(user)
     return None if value.split(":", 1)[0] in {"0", "root"} else value
 
@@ -582,7 +595,7 @@ async def upload_private_text(
 
     local_path = _temporary_private_file(content)
     try:
-        agent_user = _nonroot_agent_user(environment)
+        agent_user = await _nonroot_agent_user(environment)
         if agent_user is None:
             await environment.upload_file(local_path, remote_path)
         else:
@@ -608,9 +621,9 @@ async def install_sidecar(
     # carry training.utils; install_sidecar runs client-side only.
     from training.utils.phase_tracing import phase_span
 
-    agent_user = _nonroot_agent_user(environment)
+    agent_user = await _nonroot_agent_user(environment)
     if agent_user is not None:
-        # Harbor runs agent setup under task.config.agent.user. /logs/tito and
+        # Agent setup runs as the effective task user. /logs/tito and
         # /logs/agent may be root-owned or absent. Prepare these exact paths
         # without changing /logs/verifier or any other task-owned directory.
         # Later uploads use root-owned staging and agent-side copies.
@@ -835,7 +848,7 @@ async def terminalize_sidecar(
     await upload_private_text(
         environment, content=payload, remote_path=SIDECAR_TERMINAL_STAGING_PATH
     )
-    agent_user = _nonroot_agent_user(environment)
+    agent_user = await _nonroot_agent_user(environment)
     published = await environment.exec(
         command=(
             f"chmod 600 {SIDECAR_TERMINAL_STAGING_PATH} && "

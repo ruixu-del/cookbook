@@ -679,6 +679,8 @@ def test_install_sidecar_uploads_bundle_and_returns_private_endpoint(
 
         async def exec(self, *, command, cwd=None):
             calls.append(("exec", (command, cwd)))
+            if command == "id -u":
+                return SimpleNamespace(return_code=0, stdout="0\n", stderr="")
             if f"cat {sidecar_runtime.SIDECAR_ENDPOINT_PATH}" in command:
                 return SimpleNamespace(
                     return_code=0,
@@ -811,6 +813,86 @@ def test_install_sidecar_prepares_only_its_paths_as_root_for_named_agent(
     assert all("inference-key" not in command for command, _user in environment.calls)
 
 
+@pytest.mark.parametrize("default_user_present", [False, True])
+def test_install_sidecar_detects_implicit_nonroot_image_user(
+    tmp_path, default_user_present
+) -> None:
+    class Environment:
+        def __init__(self):
+            self.probes = 0
+            self.prepared = False
+            self.uploads = []
+            self.agent_copies = 0
+
+        async def upload_file(self, source, target):
+            assert Path(source).is_file()
+            assert self.prepared
+            assert target.startswith("/tmp/fireworks-tito-upload-")
+            self.uploads.append(target)
+
+        async def exec(self, *, command, cwd=None, user=None):
+            assert cwd == "/"
+            if command == "id -u":
+                assert user is None
+                self.probes += 1
+                return SimpleNamespace(return_code=0, stdout="1001\n", stderr="")
+            if "chown -- 1001" in command and sidecar_runtime.SIDECAR_ROOT in command:
+                assert user == "root"
+                self.prepared = True
+            elif "cp -T --remove-destination" in command:
+                assert user == "1001"
+                self.agent_copies += 1
+            elif "nohup " in command:
+                assert user == "1001"
+                assert self.agent_copies == 2
+            elif f"cat {sidecar_runtime.SIDECAR_ENDPOINT_PATH}" in command:
+                assert user == "1001"
+                return SimpleNamespace(
+                    return_code=0,
+                    stdout=json.dumps({
+                        "trajectory_id": "trajectory-1",
+                        "openai_base_url": "http://127.0.0.1:4567/v1",
+                        "api_key": "private-key",
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    bundle = tmp_path / "bundle.zip"
+    bundle.write_bytes(b"bundle")
+    environment = Environment()
+    if default_user_present:
+        environment.default_user = None
+    endpoint = asyncio.run(sidecar_runtime.install_sidecar(
+        environment, bundle_path=bundle, launch_spec="{}"
+    ))
+    assert endpoint["trajectory_id"] == "trajectory-1"
+    assert environment.probes == 1
+    assert environment.agent_copies == 2
+    asyncio.run(sidecar_runtime.upload_private_text(
+        environment, content="private", remote_path="/tmp/fireworks-tito-sidecar/extra.json"
+    ))
+    assert environment.probes == 1
+    assert environment.agent_copies == 3
+
+
+def test_install_sidecar_rejects_invalid_effective_uid_without_output(tmp_path) -> None:
+    class Environment:
+        default_user = None
+
+        async def exec(self, *, command, cwd=None):
+            assert command == "id -u"
+            return SimpleNamespace(return_code=0, stdout="private launch spec", stderr="")
+
+    bundle = tmp_path / "bundle.zip"
+    bundle.write_bytes(b"bundle")
+    with pytest.raises(RuntimeError, match="determine the effective TITO agent user") as exc:
+        asyncio.run(sidecar_runtime.install_sidecar(
+            Environment(), bundle_path=bundle, launch_spec="private launch spec"
+        ))
+    assert "private launch spec" not in str(exc.value)
+
+
 def test_install_sidecar_preparation_error_is_specific_and_redacted(tmp_path) -> None:
     class Environment:
         default_user = "auditor"
@@ -849,6 +931,8 @@ def test_install_sidecar_invalid_endpoint_does_not_echo_sandbox_output(tmp_path)
 
         async def exec(self, *, command, cwd=None):
             assert cwd == "/"
+            if command == "id -u":
+                return SimpleNamespace(return_code=0, stdout="0\n", stderr="")
             if f"cat {sidecar_runtime.SIDECAR_ENDPOINT_PATH}" in command:
                 return SimpleNamespace(
                     return_code=0,
@@ -877,6 +961,8 @@ def test_terminalize_sidecar_publishes_terminal_json_atomically(tmp_path) -> Non
 
         async def exec(self, *, command, cwd=None):
             calls.append(("exec", (command, cwd)))
+            if command == "id -u":
+                return SimpleNamespace(return_code=0, stdout="0\n", stderr="")
             return SimpleNamespace(return_code=0, stdout="", stderr="")
 
     asyncio.run(
@@ -893,7 +979,8 @@ def test_terminalize_sidecar_publishes_terminal_json_atomically(tmp_path) -> Non
     ]
     exec_calls = [value for kind, value in calls if kind == "exec"]
     assert all(cwd == "/" for _command, cwd in exec_calls)
-    commands = [command for command, _cwd in exec_calls]
+    commands = [command for command, _cwd in exec_calls if command != "id -u"]
+    assert [command for command, _cwd in exec_calls].count("id -u") == 1
     assert sidecar_runtime.SIDECAR_TERMINAL_STAGING_PATH in commands[0]
     assert f"mv -fT -- {sidecar_runtime.SIDECAR_TERMINAL_STAGING_PATH}" in commands[0]
     assert sidecar_runtime.SIDECAR_TERMINAL_PATH in commands[0]
@@ -1034,6 +1121,8 @@ def test_terminalize_sidecar_fails_immediately_when_atomic_publish_fails() -> No
 
         async def exec(self, *, command, cwd=None):
             assert cwd == "/"
+            if command == "id -u":
+                return SimpleNamespace(return_code=0, stdout="0\n", stderr="")
             assert sidecar_runtime.SIDECAR_TERMINAL_STAGING_PATH in command
             return SimpleNamespace(return_code=1, stdout="", stderr="mv failed")
 
@@ -1192,6 +1281,8 @@ def test_agents_write_only_the_loopback_trajectory_endpoint(tmp_path) -> None:
 
         async def exec(self, *, command, **_kwargs):
             self.commands.append(command)
+            if command == "id -u":
+                return SimpleNamespace(return_code=0, stdout="0\n", stderr="")
             return SimpleNamespace(return_code=0, stdout="", stderr="")
 
         async def upload_file(self, source, target):
